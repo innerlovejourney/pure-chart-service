@@ -84,6 +84,10 @@ function normalizeHouses(raw) {
 // ============================
 // Routes
 // ============================
+// Root route (Railway health check)
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "PURE Chart Service" });
+});
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
