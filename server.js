@@ -87,6 +87,9 @@ function normalizeHouses(raw) {
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
+app.get("/api/ping", (req, res) => {
+  res.json({ ok: true, ping: "pong" });
+});
 
 app.post("/api/chart/western", async (req, res) => {
   try {
