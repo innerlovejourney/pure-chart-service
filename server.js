@@ -6,6 +6,11 @@ import "dotenv/config";
 const app = express();
 app.use(cors());
 app.use(express.json());
+// Log elke inkomende request (zodat we zien of ChatGPT je endpoint raakt)
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}`);
+  next();
+});
 
 const ASTRO_BASE = "https://json.astrologyapi.com/v1";
 const USER = process.env.ASTROLOGY_API_USER_ID;
