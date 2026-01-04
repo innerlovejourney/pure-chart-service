@@ -1,169 +1,236 @@
-/**
- * PURE Chart Service (Railway/Render-ready)
- * - Uses built-in fetch (Node 18+)
- * - Accepts minimal birth data and auto-fills timezone for NL
- * - Proxies AstrologyAPI Western Chart endpoint
- */
+// server.js
+// PURE Chart Service - Railway friendly
+// Endpoints:
+//   GET  /ping
+//   POST /api/chart/western
+//
+// Required env vars (Railway Variables):
+//   ASTROLOGY_API_USER_ID
+//   ASTROLOGY_API_KEY
+//
+// Optional:
+//   ASTROLOGY_API_BASE (default: https://json.astrologyapi.com/v1)
 
-const express = require("express");
+import express from "express";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 8080;
 
-// ==== REQUIRED ENV VARS ====
-// Set these in Railway/Render environment variables (NOT in code)
 const ASTROLOGY_API_USER_ID = process.env.ASTROLOGY_API_USER_ID;
 const ASTROLOGY_API_KEY = process.env.ASTROLOGY_API_KEY;
+const ASTROLOGY_API_BASE =
+  process.env.ASTROLOGY_API_BASE || "https://json.astrologyapi.com/v1";
 
-// AstrologyAPI base (most common)
-const ASTROLOGY_API_BASE = "https://json.astrologyapi.com/v1";
+// -------------------- Helpers --------------------
 
-// Helpers
-function requireEnv() {
-  if (!ASTROLOGY_API_USER_ID || !ASTROLOGY_API_KEY) {
-    return "Missing ASTROLOGY_API_USER_ID or ASTROLOGY_API_KEY in environment variables.";
+function requireEnv(name, value) {
+  if (!value) {
+    const err = new Error(`${name} ontbreekt. Zet deze in Railway Variables.`);
+    err.statusCode = 500;
+    throw err;
   }
-  return null;
 }
 
-function basicAuthHeader(userId, apiKey) {
-  const token = Buffer.from(`${userId}:${apiKey}`).toString("base64");
-  return `Basic ${token}`;
+/**
+ * Compute timezone offset in hours for a given local datetime in a given IANA timezone.
+ * Returns a number like 1 or 2 (can be decimals for other zones).
+ *
+ * Works without extra dependencies (Luxon/Moment not needed).
+ */
+function getTzOffsetHours(dateISO, timeHHMM, timeZone) {
+  // dateISO: "1981-10-17"
+  // timeHHMM: "08:55"
+  const [y, m, d] = dateISO.split("-").map((n) => parseInt(n, 10));
+  const [hh, mm] = timeHHMM.split(":").map((n) => parseInt(n, 10));
+
+  // Start with a UTC date constructed from the provided wall time.
+  // We'll compare what that "instant" looks like in the requested time zone to infer offset.
+  const utcGuess = new Date(Date.UTC(y, m - 1, d, hh, mm, 0));
+
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
+  const parts = dtf.formatToParts(utcGuess);
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+
+  // This is the "local time" in the target time zone for the utcGuess instant.
+  const localAsUTC = Date.UTC(
+    parseInt(map.year, 10),
+    parseInt(map.month, 10) - 1,
+    parseInt(map.day, 10),
+    parseInt(map.hour, 10),
+    parseInt(map.minute, 10),
+    parseInt(map.second, 10)
+  );
+
+  // Offset = localTime - utcTime (in minutes/hours)
+  const offsetMinutes = (localAsUTC - utcGuess.getTime()) / 60000;
+  const offsetHours = offsetMinutes / 60;
+
+  // Round to 2 decimals (safe for most APIs)
+  return Math.round(offsetHours * 100) / 100;
 }
 
-function normalizeTimezone({ timezone, location, country }) {
-  // If user already provides timezone → use it
-  if (timezone && String(timezone).trim()) return String(timezone).trim();
-
-  const loc = (location || "").toLowerCase();
-  const c = (country || "").toLowerCase();
-
-  // Default for NL / Netherlands
-  const looksNL =
-    c === "nl" ||
-    c.includes("netherlands") ||
-    c.includes("nederland") ||
-    loc.includes("nederland") ||
-    loc.includes("netherlands") ||
-    loc.includes(", nl") ||
-    loc.endsWith(" nl");
-
-  if (looksNL) return "Europe/Amsterdam";
-
-  // Otherwise: leave undefined (API might still accept, but we don't guess other countries)
-  return undefined;
+function isValidDateISO(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-function validateBirth({ date, time, location }) {
-  if (!date || !time || !location) {
-    return "Missing required fields: date, time, location";
+function isValidTimeHHMM(s) {
+  return typeof s === "string" && /^\d{2}:\d{2}$/.test(s);
+}
+
+async function callAstrologyApi(endpoint, payload) {
+  requireEnv("ASTROLOGY_API_USER_ID", ASTROLOGY_API_USER_ID);
+  requireEnv("ASTROLOGY_API_KEY", ASTROLOGY_API_KEY);
+
+  const url = `${ASTROLOGY_API_BASE.replace(/\/$/, "")}/${endpoint.replace(
+    /^\//,
+    ""
+  )}`;
+
+  const auth = Buffer.from(
+    `${ASTROLOGY_API_USER_ID}:${ASTROLOGY_API_KEY}`
+  ).toString("base64");
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
   }
-  // Basic format sanity checks (not strict)
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return "Invalid date format. Use YYYY-MM-DD.";
-  if (!/^\d{2}:\d{2}$/.test(time)) return "Invalid time format. Use HH:MM.";
-  return null;
+
+  if (!res.ok) {
+    const err = new Error("AstrologyAPI request failed");
+    err.statusCode = 502;
+    err.details = { status: res.status, response: data };
+    throw err;
+  }
+
+  // AstrologyAPI sometimes returns { status: false, msg: "..." }
+  if (data && (data.status === false || data.status === "false")) {
+    const err = new Error("AstrologyAPI rejected the request");
+    err.statusCode = 502;
+    err.details = data;
+    throw err;
+  }
+
+  return data;
 }
 
-// Routes
-app.get("/", (req, res) => res.status(200).send("OK"));
+// -------------------- Routes --------------------
 
 app.get("/ping", (req, res) => {
-  res.status(200).send("OK");
+  res.status(200).json({ ok: true, message: "OK" });
 });
 
 app.post("/api/chart/western", async (req, res) => {
   try {
-    const envErr = requireEnv();
-    if (envErr) return res.status(500).json({ ok: false, error: envErr });
+    const {
+      name = "",
+      date,
+      time,
+      latitude,
+      longitude,
+      timezone = "Europe/Amsterdam",
+      tz_offset, // optional override if user provides it
+    } = req.body || {};
 
-    const { name, date, time, location, country, timezone } = req.body || {};
+    // Basic validation
+    if (!isValidDateISO(date)) {
+      return res.status(400).json({
+        success: false,
+        error: "Ongeldige datum. Gebruik 'YYYY-MM-DD' (bijv. 1981-10-17).",
+      });
+    }
+    if (!isValidTimeHHMM(time)) {
+      return res.status(400).json({
+        success: false,
+        error: "Ongeldige tijd. Gebruik 'HH:MM' (bijv. 08:55).",
+      });
+    }
+    if (typeof latitude !== "number" || typeof longitude !== "number") {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Latitude en longitude zijn verplicht (nummer). Voorbeeld: 52.6424 en 5.0597.",
+      });
+    }
+    if (typeof timezone !== "string" || timezone.length < 3) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Timezone is verplicht. Gebruik bijv. 'Europe/Amsterdam'.",
+      });
+    }
 
-    const valErr = validateBirth({ date, time, location });
-    if (valErr) return res.status(400).json({ ok: false, error: valErr });
+    // Convert date/time to fields AstrologyAPI expects
+    const [year, month, day] = date.split("-").map((n) => parseInt(n, 10));
+    const [hour, min] = time.split(":").map((n) => parseInt(n, 10));
 
-    const tz = normalizeTimezone({ timezone, location, country });
+    // Determine tz offset hours (Netherlands: usually 1 or 2 depending on DST)
+    const tzone =
+      typeof tz_offset === "number"
+        ? tz_offset
+        : getTzOffsetHours(date, time, timezone);
 
-    // AstrologyAPI expects these common fields:
-    // day, month, year, hour, min, lat, lon, tzone
-    // But we do NOT have lat/lon here. Many people use the "place -> lat/lon" flow.
-    // So we call the endpoint that accepts "place" if available, otherwise we return a clear error.
-    //
-    // IMPORTANT:
-    // Some AstrologyAPI plans/endpoints support "place" directly, others require lat/lon.
-    // We'll implement a robust approach:
-    // 1) Try a "place based" request (if supported)
-    // 2) If API responds with lat/lon required → return that message clearly
-
-    const [year, month, day] = date.split("-").map((x) => parseInt(x, 10));
-    const [hour, min] = time.split(":").map((x) => parseInt(x, 10));
-
-    const payloadPlace = {
-      name: name || "",
+    // Payload for AstrologyAPI "natal_wheel_chart" (Starter plan supports this)
+    const payload = {
       day,
       month,
       year,
       hour,
       min,
-      place: String(location).trim(), // keep it simple: "Hoorn" / "Hoorn, NL"
-      tzone: tz || undefined,
+      lat: latitude,
+      lon: longitude,
+      tzone, // numeric offset in hours
     };
 
-    // Remove undefined keys
-    Object.keys(payloadPlace).forEach((k) => payloadPlace[k] === undefined && delete payloadPlace[k]);
-
-    const auth = basicAuthHeader(ASTROLOGY_API_USER_ID, ASTROLOGY_API_KEY);
-
-    // This endpoint name can differ; "western_horoscope" isn't it.
-    // The commonly used endpoint for birth chart is "western_chart_data" or "birth_details" depending on account.
-    // We'll use western_chart_data first; if your account uses a different endpoint, we switch once.
-    const endpoint = `${ASTROLOGY_API_BASE}/western_chart_data`;
-
-    const r = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: auth,
-      },
-      body: JSON.stringify(payloadPlace),
-    });
-
-    const text = await r.text();
-
-    // Try parse JSON
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { raw: text };
-    }
-
-    if (!r.ok) {
-      // Give a very clear error back to ChatGPT (so it doesn't keep asking the user)
-      return res.status(r.status).json({
-        ok: false,
-        status: r.status,
-        error: "AstrologyAPI request failed",
-        details: data,
-        hint:
-          "Als je AstrologyAPI-account lat/lon vereist, voeg latitude + longitude toe in je requestBody of voeg een geocode stap toe in de server.",
-      });
-    }
+    const chart = await callAstrologyApi("natal_wheel_chart", payload);
 
     return res.status(200).json({
-      ok: true,
-      input: { name: name || "", date, time, location, timezone: tz || null },
-      chart: data,
+      success: true,
+      chart,
+      meta: {
+        name,
+        date,
+        time,
+        latitude,
+        longitude,
+        timezone,
+        tzone,
+      },
     });
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: "Internal server error",
-      details: String(e?.message || e),
+    const status = e.statusCode || 500;
+    res.status(status).json({
+      success: false,
+      error: e.message || "Onbekende fout",
+      details: e.details || null,
     });
   }
 });
+
+// -------------------- Start --------------------
 
 app.listen(PORT, () => {
   console.log(`PURE Chart Service draait op poort ${PORT}`);
