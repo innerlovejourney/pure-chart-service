@@ -1,30 +1,26 @@
-// server.js
-// PURE Chart Service - Railway friendly
-// Endpoints:
-//   GET  /ping
-//   POST /api/chart/western
-//
-// Required env vars (Railway Variables):
-//   ASTROLOGY_API_USER_ID
-//   ASTROLOGY_API_KEY
-//
-// Optional:
-//   ASTROLOGY_API_BASE (default: https://json.astrologyapi.com/v1)
+// server.js (Railway + Express + Axios, CommonJS)
 
-import express from "express";
+const express = require("express");
+const axios = require("axios");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 8080;
 
-const ASTROLOGY_API_USER_ID = process.env.ASTROLOGY_API_USER_ID;
-const ASTROLOGY_API_KEY = process.env.ASTROLOGY_API_KEY;
+// Railway Variables (zet deze in Railway -> Variables)
+const ASTROLOGY_API_USER_ID = process.env.ASTROLOGY_API_USER_ID; // bijv. 648970
+const ASTROLOGY_API_KEY = process.env.ASTROLOGY_API_KEY;         // jouw key
 const ASTROLOGY_API_BASE =
   process.env.ASTROLOGY_API_BASE || "https://json.astrologyapi.com/v1";
 
-// -------------------- Helpers --------------------
-
+// Helpers
+function isValidDateISO(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+function isValidTimeHHMM(s) {
+  return typeof s === "string" && /^\d{2}:\d{2}$/.test(s);
+}
 function requireEnv(name, value) {
   if (!value) {
     const err = new Error(`${name} ontbreekt. Zet deze in Railway Variables.`);
@@ -33,20 +29,11 @@ function requireEnv(name, value) {
   }
 }
 
-/**
- * Compute timezone offset in hours for a given local datetime in a given IANA timezone.
- * Returns a number like 1 or 2 (can be decimals for other zones).
- *
- * Works without extra dependencies (Luxon/Moment not needed).
- */
+// Berekent timezone offset (tzone) correct voor NL incl zomertijd
 function getTzOffsetHours(dateISO, timeHHMM, timeZone) {
-  // dateISO: "1981-10-17"
-  // timeHHMM: "08:55"
   const [y, m, d] = dateISO.split("-").map((n) => parseInt(n, 10));
   const [hh, mm] = timeHHMM.split(":").map((n) => parseInt(n, 10));
 
-  // Start with a UTC date constructed from the provided wall time.
-  // We'll compare what that "instant" looks like in the requested time zone to infer offset.
   const utcGuess = new Date(Date.UTC(y, m - 1, d, hh, mm, 0));
 
   const dtf = new Intl.DateTimeFormat("en-US", {
@@ -63,7 +50,6 @@ function getTzOffsetHours(dateISO, timeHHMM, timeZone) {
   const parts = dtf.formatToParts(utcGuess);
   const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
 
-  // This is the "local time" in the target time zone for the utcGuess instant.
   const localAsUTC = Date.UTC(
     parseInt(map.year, 10),
     parseInt(map.month, 10) - 1,
@@ -73,89 +59,33 @@ function getTzOffsetHours(dateISO, timeHHMM, timeZone) {
     parseInt(map.second, 10)
   );
 
-  // Offset = localTime - utcTime (in minutes/hours)
   const offsetMinutes = (localAsUTC - utcGuess.getTime()) / 60000;
-  const offsetHours = offsetMinutes / 60;
-
-  // Round to 2 decimals (safe for most APIs)
-  return Math.round(offsetHours * 100) / 100;
+  const offsetHours = Math.round((offsetMinutes / 60) * 100) / 100;
+  return offsetHours;
 }
 
-function isValidDateISO(s) {
-  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
-}
-
-function isValidTimeHHMM(s) {
-  return typeof s === "string" && /^\d{2}:\d{2}$/.test(s);
-}
-
-async function callAstrologyApi(endpoint, payload) {
-  requireEnv("ASTROLOGY_API_USER_ID", ASTROLOGY_API_USER_ID);
-  requireEnv("ASTROLOGY_API_KEY", ASTROLOGY_API_KEY);
-
-  const url = `${ASTROLOGY_API_BASE.replace(/\/$/, "")}/${endpoint.replace(
-    /^\//,
-    ""
-  )}`;
-
-  const auth = Buffer.from(
-    `${ASTROLOGY_API_USER_ID}:${ASTROLOGY_API_KEY}`
-  ).toString("base64");
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${auth}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
-
-  if (!res.ok) {
-    const err = new Error("AstrologyAPI request failed");
-    err.statusCode = 502;
-    err.details = { status: res.status, response: data };
-    throw err;
-  }
-
-  // AstrologyAPI sometimes returns { status: false, msg: "..." }
-  if (data && (data.status === false || data.status === "false")) {
-    const err = new Error("AstrologyAPI rejected the request");
-    err.statusCode = 502;
-    err.details = data;
-    throw err;
-  }
-
-  return data;
-}
-
-// -------------------- Routes --------------------
-
+// Ping (voor connector test)
 app.get("/ping", (req, res) => {
   res.status(200).json({ ok: true, message: "OK" });
 });
 
+// Western chart route
 app.post("/api/chart/western", async (req, res) => {
   try {
+    requireEnv("ASTROLOGY_API_USER_ID", ASTROLOGY_API_USER_ID);
+    requireEnv("ASTROLOGY_API_KEY", ASTROLOGY_API_KEY);
+
     const {
       name = "",
       date,
       time,
       latitude,
       longitude,
-      timezone = "Europe/Amsterdam",
-      tz_offset, // optional override if user provides it
+      timezone = "Europe/Amsterdam", // default NL
+      tz_offset, // optioneel: als je dit zelf wil meegeven
     } = req.body || {};
 
-    // Basic validation
+    // Validatie
     if (!isValidDateISO(date)) {
       return res.status(400).json({
         success: false,
@@ -172,28 +102,19 @@ app.post("/api/chart/western", async (req, res) => {
       return res.status(400).json({
         success: false,
         error:
-          "Latitude en longitude zijn verplicht (nummer). Voorbeeld: 52.6424 en 5.0597.",
-      });
-    }
-    if (typeof timezone !== "string" || timezone.length < 3) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Timezone is verplicht. Gebruik bijv. 'Europe/Amsterdam'.",
+          "Latitude en longitude zijn verplicht (nummer). Voorbeeld Hoorn: 52.6424, 5.0597",
       });
     }
 
-    // Convert date/time to fields AstrologyAPI expects
     const [year, month, day] = date.split("-").map((n) => parseInt(n, 10));
     const [hour, min] = time.split(":").map((n) => parseInt(n, 10));
 
-    // Determine tz offset hours (Netherlands: usually 1 or 2 depending on DST)
     const tzone =
       typeof tz_offset === "number"
         ? tz_offset
         : getTzOffsetHours(date, time, timezone);
 
-    // Payload for AstrologyAPI "natal_wheel_chart" (Starter plan supports this)
+    // AstrologyAPI payload (belangrijk: lat/lon + tzone)
     const payload = {
       day,
       month,
@@ -202,35 +123,74 @@ app.post("/api/chart/western", async (req, res) => {
       min,
       lat: latitude,
       lon: longitude,
-      tzone, // numeric offset in hours
+      tzone,
     };
 
-    const chart = await callAstrologyApi("natal_wheel_chart", payload);
+    // Endpoint dat jij wilt gebruiken (staat bij jou in de API lijst)
+    const endpointPath = "natal_wheel_chart";
+    const endpoint = `${ASTROLOGY_API_BASE.replace(/\/$/, "")}/${endpointPath}`;
 
+    // ✅ STAP 1 (debug logging) - hier staat het precies
+    console.log("🔮 AstrologyAPI endpoint:", endpoint);
+    console.log("📦 AstrologyAPI payload:", payload);
+    console.log("🔐 Using User ID:", ASTROLOGY_API_USER_ID);
+
+    // Call AstrologyAPI
+    const response = await axios.post(endpoint, payload, {
+      auth: {
+        username: ASTROLOGY_API_USER_ID,
+        password: ASTROLOGY_API_KEY,
+      },
+      headers: {
+        "Content-Type": "application/json",
+      },
+      timeout: 30000,
+      validateStatus: () => true, // we handelen fouten zelf af
+    });
+
+    // Als AstrologyAPI geen 200-299 geeft
+    if (response.status < 200 || response.status >= 300) {
+      console.log("❌ AstrologyAPI status:", response.status);
+      console.log("❌ AstrologyAPI response:", response.data);
+
+      return res.status(502).json({
+        success: false,
+        error: "AstrologyAPI request failed",
+        details: {
+          status: response.status,
+          response: response.data,
+        },
+        hint:
+          "Controleer je plan/endpoint toegang in AstrologyAPI dashboard. Als je account lat/lon vereist: die zitten nu in je request. Als je nog steeds 'not authorized' ziet: het is plan-autorisation.",
+      });
+    }
+
+    // Soms geeft AstrologyAPI status=false binnen 200
+    if (response.data && response.data.status === false) {
+      console.log("❌ AstrologyAPI returned status=false:", response.data);
+
+      return res.status(502).json({
+        success: false,
+        error: "AstrologyAPI rejected the request",
+        details: response.data,
+      });
+    }
+
+    // OK
     return res.status(200).json({
       success: true,
-      chart,
-      meta: {
-        name,
-        date,
-        time,
-        latitude,
-        longitude,
-        timezone,
-        tzone,
-      },
+      chart: response.data,
+      meta: { name, date, time, latitude, longitude, timezone, tzone },
     });
   } catch (e) {
-    const status = e.statusCode || 500;
-    res.status(status).json({
+    console.log("🔥 Server error:", e);
+
+    return res.status(500).json({
       success: false,
-      error: e.message || "Onbekende fout",
-      details: e.details || null,
+      error: e.message || "Onbekende serverfout",
     });
   }
 });
-
-// -------------------- Start --------------------
 
 app.listen(PORT, () => {
   console.log(`PURE Chart Service draait op poort ${PORT}`);
